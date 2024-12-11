@@ -2,6 +2,8 @@ import time
 import yfinance as yf
 import pandas as pd
 from scipy.stats import ttest_1samp
+import gspread
+from oauth2client.service_account import ServiceAccountCredentials
 
 class LoadData():
     """
@@ -16,7 +18,6 @@ class LoadData():
         """
         self._dataframe_stock = None
         self.start_date = start_date
-        #If there is no end date is specifically stated, use default.
         if end_date == None:
             self.end_date = time.time()
         else:
@@ -31,7 +32,6 @@ class LoadData():
         It returns a pd.DataFrame with the [Open, High, Low, Close, Adj Close, Volume].
         """
         if self._dataframe_stock == None:
-            #Download daily data from yfinance.
             self._dataframe_stock = yf.download(self.ticker, start=self.start_date, end=self.end_date, interval='1d')
             self._dataframe_stock.columns = self._dataframe_stock.columns.get_level_values(0)
         return self._dataframe_stock
@@ -65,7 +65,6 @@ class VolumeBreakoutDetect():
         Returns a pd.DataFrame with historical OHLCV data.
         """
         if self._dataframe_stock is None:
-            #Instantiate LoadData and fetch the data only when needed for storage efficiancy.
             self._dataframe_stock = LoadData(self.start_date, self.end_date, self.ticker).dataframe_stock
         return self._dataframe_stock
 
@@ -74,95 +73,191 @@ class VolumeBreakoutDetect():
         This function is to calculate a 22-day rolling median of the trading volume and add it as a new column in the df.
         """
         dataframe_stock = self.dataframe_stock.copy()
-        #Calculate the rolling median volume over 22 days.
         dataframe_stock['Median Volume'] = dataframe_stock['Volume'].rolling(window=22).median()
         return dataframe_stock
 
     def generate_excel(self, output_file):
         """
-        This function helps us generates an Excel report containing parameters used for the analysis, 
-        statistics of average returns over multiple holding periods post-breakout, and detailed information on each breakout day.
-
+        Generates an Excel report containing:
+        - Parameters used for the analysis.
+        - Statistics of average returns over multiple holding periods post-breakout, including Max Return.
+        - Detailed information on each breakout day.
+        
         'output_file' is the file path where the Excel output should be saved.
-    
-        Returns 'breakout_days pd.DataFrame that is containing rows for each identified breakout day along with 
-        corresponding returns. and 'stats_df'that is containing statistical summaries of returns for various holding periods post-breakout.
+        
+        Returns:
+            - breakout_days: pd.DataFrame containing rows for each identified breakout day along with corresponding returns.
+            - stats_df: pd.DataFrame containing statistical summaries of returns for various holding periods post-breakout.
         """
         dataframe_stock = self._get_median_rolling_data()
 
-        #Mark the volume breakout days.
         dataframe_stock['Volume Breakout'] = dataframe_stock['Volume'] > self.volume_threshold * dataframe_stock['Median Volume']
 
-        #Calculate the daily return percentage.
         dataframe_stock['Daily Return (%)'] = dataframe_stock['Close'].pct_change() * 100
 
-        #State the holding periods to analyze returns after breakouts, this we can chnage at any time in case we want to see something else.
+        dataframe_stock['Next Day Close'] = dataframe_stock['Close'].shift(-1)
+
         return_periods = [1, 2, 5, 10, 15, 20, 25, 30]
 
-        #Calculate the returns for various forward periods.
         for period in return_periods:
-            dataframe_stock[f'{period}D Return (%)'] = dataframe_stock['Close'].pct_change(periods=period) * 100
+            if period == 1:
+                dataframe_stock[f'{period}D Return (%)'] = (
+                    dataframe_stock['Next Day Close'] - dataframe_stock['Close']
+                ) / dataframe_stock['Close'] * 100
+            else:
+                dataframe_stock[f'{period}D Return (%)'] = (
+                    dataframe_stock['Close'].shift(-period) - dataframe_stock['Close']
+                ) / dataframe_stock['Close'] * 100
 
-        #Filter results to get only the breakout days.
         breakout_days = dataframe_stock[dataframe_stock['Volume Breakout']].copy()
 
-        #Convert index to string dates and reset index.
         breakout_days['Date'] = breakout_days.index.astype(str) if breakout_days.index.name == 'Date' else breakout_days.index.map(str)
         breakout_days.reset_index(drop=True, inplace=True)
 
-        #Store parameters used.
+        positive_breakout_days = breakout_days[breakout_days['Daily Return (%)'] > 0].copy()
+
+        def calculate_stats(data):
+            stats = []
+            for period in return_periods:
+                returns = data[f'{period}D Return (%)'].dropna()
+                avg_return = returns.mean()
+
+                t_stat = ttest_1samp(returns, 0).statistic if len(returns) > 1 else float('nan')
+
+                max_return = returns.max() if len(returns) > 0 else float('nan')
+
+                max_drawdown = (returns.min() / avg_return) if avg_return != 0 else float('nan')
+
+                num_profitable = (returns > 0).sum()
+                total_count = len(returns)
+                pop = num_profitable / total_count if total_count > 0 else 0
+
+                stats.append({
+                    "Period": f'{period}D',
+                    "Average Return (%)": avg_return,
+                    "Max Return (%)": max_return,
+                    "T-Stat": t_stat,
+                    "Max Drawdown": max_drawdown,
+                    "Number of Times Profitable": num_profitable,
+                    "Probability of Profit (POP)": pop,
+                    "Total Count": total_count
+                })
+            return pd.DataFrame(stats).set_index("Period")
+
+        stats_df = calculate_stats(breakout_days)
+        positive_stats_df = calculate_stats(positive_breakout_days)
+
         parameters = {
             "Volume Threshold (%)": self.volume_threshold * 100,
             "Ticker": self.ticker,
             "Start Date": self.start_date,
             "End Date": self.end_date,
         }
-
-        #Calculate statistics for each holding period.
-        stats = []
-        for period in return_periods:
-            returns = breakout_days[f'{period}D Return (%)'].dropna()
-            avg_return = returns.mean()
-            
-            #Calculate T-Stat against null hypothesis of zero mean return.
-            t_stat = ttest_1samp(returns, 0).statistic if len(returns) > 1 else float('nan')
-            
-            #Calculate the Max drawdown. Here it's defined as (min_return / avg_return). 
-            max_drawdown = (returns.min() / avg_return) if avg_return != 0 else float('nan')
-            
-            #Calculate the profitability metrics.
-            num_profitable = (returns > 0).sum()
-            total_count = len(returns)
-            pop = num_profitable / total_count if total_count > 0 else 0
-
-            stats.append({
-                "Period": f'{period}D',
-                "Average Return (%)": avg_return,
-                "T-Stat": t_stat,
-                "Max Drawdown": max_drawdown,
-                "Number of Times Profitable": num_profitable,
-                "Probability of Profit (POP)": pop,
-                "Total Count": total_count
-            })
-
-        #Send stats to DataFrame and set period as index.
-        stats_df = pd.DataFrame(stats)
-        stats_df.set_index("Period", inplace=True)
-
-        #Send parameters to DataFrame.
         parameters_df = pd.DataFrame.from_dict(parameters, orient='index', columns=['Value'])
 
-
-        #Sheet 1: Parameters
-        #Sheet 2: Average Returns
-        #Sheet 3: Detailed Breakout Days
         with pd.ExcelWriter(output_file, engine='xlsxwriter') as writer:
             parameters_df.to_excel(writer, sheet_name="Parameters")
-            stats_df.to_excel(writer, sheet_name="Average Returns")
+            
+            stats_df.to_excel(writer, sheet_name="Average Returns", startrow=2, startcol=0)
+            positive_stats_df.to_excel(writer, sheet_name="Average Returns", startrow=len(stats_df) + 8, startcol=0)
+            
+            worksheet = writer.sheets["Average Returns"]
+            worksheet.write(0, 0, "Average Returns")
+            worksheet.write(len(stats_df) + 6, 0, "Positive Average Returns")
+            
             breakout_days.to_excel(writer, sheet_name="Breakout Days")
 
         return breakout_days, stats_df
 
+    def write_to_google_sheets(self, sheet_name):
+        """
+        Writes the analysis data to a Google Sheets document.
+        - The data includes: Parameters, Average Returns, and Positive Average Returns.
 
+        'sheet_name': Name of the Google Sheet to create or update.
 
- 
+        Returns:
+            - breakout_days: pd.DataFrame containing rows for each identified breakout day.
+            - stats_df: pd.DataFrame containing statistics for all breakout days.
+            - positive_stats_df: pd.DataFrame containing statistics for breakout days with positive daily returns.
+        """
+        dataframe_stock = self._get_median_rolling_data()
+
+        dataframe_stock['Volume Breakout'] = dataframe_stock['Volume'] > self.volume_threshold * dataframe_stock['Median Volume']
+
+        dataframe_stock['Daily Return (%)'] = dataframe_stock['Close'].pct_change() * 100
+
+        dataframe_stock['Next Day Close'] = dataframe_stock['Close'].shift(-1)
+
+        return_periods = [1, 2, 5, 10, 15, 20, 25, 30]
+
+        for period in return_periods:
+            if period == 1:
+                dataframe_stock[f'{period}D Return (%)'] = (
+                    dataframe_stock['Next Day Close'] - dataframe_stock['Close']
+                ) / dataframe_stock['Close'] * 100
+            else:
+                dataframe_stock[f'{period}D Return (%)'] = (
+                    dataframe_stock['Close'].shift(-period) - dataframe_stock['Next Day Close']
+                ) / dataframe_stock['Next Day Close'] * 100
+
+        breakout_days = dataframe_stock[dataframe_stock['Volume Breakout']].copy()
+        breakout_days['Date'] = breakout_days.index.astype(str)
+        breakout_days.reset_index(drop=True, inplace=True)
+
+        positive_breakout_days = breakout_days[breakout_days['Daily Return (%)'] > 0].copy()
+
+        def calculate_stats(data):
+            stats = []
+            for period in return_periods:
+                returns = data[f'{period}D Return (%)'].dropna()
+                avg_return = returns.mean()
+                max_return = returns.max()
+                t_stat = ttest_1samp(returns, 0).statistic if len(returns) > 1 else float('nan')
+                max_drawdown = (returns.min() / avg_return) if avg_return != 0 else float('nan')
+                num_profitable = (returns > 0).sum()
+                total_count = len(returns)
+                pop = num_profitable / total_count if total_count > 0 else 0
+                stats.append({
+                    "Period": f'{period}D',
+                    "Average Return (%)": avg_return,
+                    "Max Return (%)": max_return,
+                    "T-Stat": t_stat,
+                    "Max Drawdown": max_drawdown,
+                    "Number of Times Profitable": num_profitable,
+                    "Probability of Profit (POP)": pop,
+                    "Total Count": total_count
+                })
+            return pd.DataFrame(stats).set_index("Period")
+
+        stats_df = calculate_stats(breakout_days)
+        positive_stats_df = calculate_stats(positive_breakout_days)
+
+        parameters = {
+            "Volume Threshold (%)": self.volume_threshold * 100,
+            "Ticker": self.ticker,
+            "Start Date": self.start_date,
+            "End Date": self.end_date,
+        }
+        parameters_df = pd.DataFrame.from_dict(parameters, orient='index', columns=['Value'])
+
+        scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+        credentials = ServiceAccountCredentials.from_json_keyfile_name("path_to_your_credentials.json", scope)
+        client = gspread.authorize(credentials)
+
+        try:
+            sheet = client.open(sheet_name)
+        except gspread.SpreadsheetNotFound:
+            sheet = client.create(sheet_name)
+
+        def write_dataframe_to_sheet(dataframe, worksheet_name):
+            worksheet = sheet.add_worksheet(title=worksheet_name, rows="1000", cols="50")
+            worksheet.clear()
+            worksheet.update([dataframe.columns.values.tolist()] + dataframe.values.tolist())
+
+        write_dataframe_to_sheet(parameters_df, "Parameters")
+        write_dataframe_to_sheet(stats_df.reset_index(), "Average Returns")
+        write_dataframe_to_sheet(positive_stats_df.reset_index(), "Positive Average Returns")
+        write_dataframe_to_sheet(breakout_days, "Breakout Days")
+
+        return breakout_days, stats_df, positive_stats_df
