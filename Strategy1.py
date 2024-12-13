@@ -40,12 +40,6 @@ class LoadData():
             self._dataframe_stock.columns = self._dataframe_stock.columns.get_level_values(0)
         return self._dataframe_stock
 
-    
-import gspread
-from gspread_dataframe import set_with_dataframe
-from google.oauth2.service_account import Credentials
-import pandas as pd
-from scipy.stats import ttest_1samp
 
 class VolumeBreakoutDetect:
     def __init__(self, start_date, end_date, ticker, threshold) -> None:
@@ -101,17 +95,17 @@ class VolumeBreakoutDetect:
             print(f"Spreadsheet '{spreadsheet_name}' not found. Ensure the file exists and is shared with the service account.")
             return
 
-        # Get or create the worksheets
+        #Get or create the worksheets.
         worksheet_params = spreadsheet.worksheet("Parameters") if "Parameters" in [ws.title for ws in spreadsheet.worksheets()] else spreadsheet.add_worksheet(title="Parameters", rows="100", cols="20")
         worksheet_stats = spreadsheet.worksheet("Average Returns") if "Average Returns" in [ws.title for ws in spreadsheet.worksheets()] else spreadsheet.add_worksheet(title="Average Returns", rows="100", cols="20")
         worksheet_breakout = spreadsheet.worksheet("Breakout Days") if "Breakout Days" in [ws.title for ws in spreadsheet.worksheets()] else spreadsheet.add_worksheet(title="Breakout Days", rows="100", cols="20")
 
-        # Clear the existing content
+        #Clear the existing content.
         worksheet_params.clear()
         worksheet_stats.clear()
         worksheet_breakout.clear()
 
-        # Generate the data
+        #Generate the data.
         dataframe_stock = self._get_median_rolling_data()
         dataframe_stock['Volume Breakout'] = dataframe_stock['Volume'] > self.volume_threshold * dataframe_stock['Median Volume']
         dataframe_stock['Daily Return (%)'] = dataframe_stock['Close'].pct_change() * 100
@@ -209,19 +203,19 @@ class VolumeBreakoutDetect:
         stats_df = calculate_stats(breakout_days, include_peak=True)
         positive_stats_df = calculate_stats(positive_breakout_days, include_peak=True)
     
-        # Write DataFrames to the Google Sheets
+        #Write DataFrames to the Google Sheets.
         set_with_dataframe(worksheet_params, parameters_df, include_index=True)
         set_with_dataframe(worksheet_stats, stats_df, include_index=True)
         set_with_dataframe(worksheet_stats, positive_stats_df, row=len(stats_df) + 3, include_index=True)
         set_with_dataframe(worksheet_breakout, breakout_days, include_index=True)
         uniform_format = CellFormat(
-            textFormat=TextFormat(bold=False),  # Remove bold
-            horizontalAlignment="LEFT"         # Align text to the left
+            textFormat=TextFormat(bold=False),
+            horizontalAlignment="LEFT"
         )
 
-        # Apply uniform formatting to each worksheet
+        #Apply uniform formatting to each worksheet.
         for worksheet in [worksheet_params, worksheet_stats, worksheet_breakout]:
-            sheet_range = f"A1:Z1000"  # Adjust the range to fit your data
+            sheet_range = f"A1:Z1000"
             format_cell_range(worksheet, sheet_range, uniform_format)
 
         print(f"Spreadsheet '{spreadsheet_name}' successfully updated.")
